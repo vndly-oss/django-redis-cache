@@ -34,6 +34,9 @@ class RedisTestCase(TestCase):
 
     def setUp(self):
         self.cache = RedisCache('', {})
+        self.patch_cache(self.cache)
+
+    def patch_cache(self, cache):
         self.client = FakeRedis()
         self.cache.writers = [self.client]
         self.cache.readers = [self.client]
@@ -300,6 +303,7 @@ class RedisTestCase(TestCase):
     def test_pickling_cache_object(self):
         p = pickle.dumps(self.cache)
         cache = pickle.loads(p)
+        self.patch_cache(cache)
         # Now let's do a simple operation using the unpickled cache object
         cache.add("addkey1", "value")
         result = cache.add("addkey1", "newvalue")
