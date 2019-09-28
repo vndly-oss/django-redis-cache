@@ -34,9 +34,6 @@ class RedisTestCase(TestCase):
 
     def setUp(self):
         self.cache = RedisCache('', {})
-        self.patch_cache(self.cache)
-
-    def patch_cache(self, cache):
         self.client = FakeRedis()
         self.cache.writers = [self.client]
         self.cache.readers = [self.client]
@@ -299,16 +296,6 @@ class RedisTestCase(TestCase):
             self.assertEqual(new_key, ':2:key1')
             self.assertIsNone(self.cache.get(key, version=1))
             self.assertEqual(self.cache.get(key, version=2), 'spam')
-
-    def test_pickling_cache_object(self):
-        p = pickle.dumps(self.cache)
-        cache = pickle.loads(p)
-        self.patch_cache(cache)
-        # Now let's do a simple operation using the unpickled cache object
-        cache.add("addkey1", "value")
-        result = cache.add("addkey1", "newvalue")
-        self.assertFalse(result)
-        self.assertEqual(cache.get("addkey1"), "value")
 
     def test_float_caching(self):
         self.cache.set('a', 1.1)
