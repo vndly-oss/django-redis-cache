@@ -1,30 +1,28 @@
 import importlib
+import itertools
 import warnings
+from functools import lru_cache
+from urllib.parse import parse_qs
+from urllib.parse import urlparse
 
 from django.core.exceptions import ImproperlyConfigured
-from django.utils import six
-from django.utils.encoding import force_text, python_2_unicode_compatible
-from django.utils.six.moves.urllib.parse import parse_qs, urlparse
 
-from redis._compat import unicode
+from redis.connection import Connection
 from redis.connection import SSLConnection
+from redis.connection import UnixDomainSocketConnection
+from redis.connection import URL_QUERY_ARGUMENT_PARSERS
 
 
-def get_servers(location):
-    """Returns a list of servers given the server argument passed in from
-    Django.
-    """
-    if isinstance(location, six.string_types):
-        servers = location.split(',')
-    elif hasattr(location, '__iter__'):
-        servers = location
-    else:
-        raise ImproperlyConfigured(
-            '"server" must be an iterable or string'
-        )
-    return servers
+def chunker(iterable, chunksize=1000):
+    iterator = iter(iterable)
+    while True:
+        chunk = tuple(itertools.islice(iterator, chunksize))
+        if not chunk:
+            return
+        yield chunk
 
 
+@lru_cache(maxsize=None)
 def import_class(path):
     module_name, class_name = path.rsplit('.', 1)
     try:
@@ -38,7 +36,7 @@ def import_class(path):
             raise ImproperlyConfigured('Cannot import "%s"' % class_name)
 
 
-def parse_connection_kwargs(server, db=None, **kwargs):
+def parse_connection_kwargs(url, db=None, **kwargs):
     """
     Return a connection pool configured from the given URL.
 
@@ -49,9 +47,14 @@ def parse_connection_kwargs(server, db=None, **kwargs):
         unix://[:password]@/path/to/socket.sock?db=0
 
     Three URL schemes are supported:
-        redis:// creates a normal TCP socket connection
-        rediss:// creates a SSL wrapped TCP socket connection
-        unix:// creates a Unix Domain Socket connection
+
+    - ```redis://``
+      <https://www.iana.org/assignments/uri-schemes/prov/redis>`_ creates a
+      normal TCP socket connection
+    - ```rediss://``
+      <https://www.iana.org/assignments/uri-schemes/prov/rediss>`_ creates
+      a SSL wrapped TCP socket connection
+    - ``unix://`` creates a Unix Domain Socket connection
 
     There are several ways to specify a database number. The parse function
     will return the first specified option:
@@ -62,97 +65,100 @@ def parse_connection_kwargs(server, db=None, **kwargs):
 
     If none of these options are specified, db=0 is used.
 
+    The ``decode_components`` argument allows this function to work with
+    percent-encoded URLs. If this argument is set to ``True`` all ``%xx``
+    escapes will be replaced by their single-character equivalents after
+    the URL has been parsed. This only applies to the ``hostname``,
+    ``path``, and ``password`` components.
+
     Any additional querystring arguments and keyword arguments will be
-    passed along to the ConnectionPool class's initializer. In the case
-    of conflicting arguments, querystring arguments always win.
+    passed along to the ConnectionPool class's initializer. The querystring
+    arguments ``socket_connect_timeout`` and ``socket_timeout`` if supplied
+    are parsed as float values. The arguments ``socket_keepalive`` and
+    ``retry_on_timeout`` are parsed to boolean values that accept
+    True/False, Yes/No values to indicate state. Invalid types cause a
+    ``UserWarning`` to be raised. In the case of conflicting arguments,
+    querystring arguments always win.
 
-    NOTE: taken from `redis.ConnectionPool.from_url` in redis-py
     """
-    kwargs['unix_socket_path'] = ''
-    if '://' in server:
-        url = server
-        url_string = url
-        url = urlparse(url)
-        qs = ''
+    schemes = ('redis://', 'rediss://', 'unix://')
+    raw_url = url
 
-        # in python2.6, custom URL schemes don't recognize querystring values
-        # they're left as part of the url.path.
-        if '?' in url.path and not url.query:
-            # chop the querystring including the ? off the end of the url
-            # and reparse it.
-            qs = url.path.split('?', 1)[1]
-            url = urlparse(url_string[:-(len(qs) + 1)])
-        else:
-            qs = url.query
+    url = urlparse(url)
+    url_options = {
+        'unix_socket_path': None
+    }
 
-        url_options = {}
-
-        for name, value in parse_qs(qs).items():
-            if value and len(value) > 0:
+    for name, value in parse_qs(url.query).items():
+        if value and len(value) > 0:
+            parser = URL_QUERY_ARGUMENT_PARSERS.get(name)
+            if parser:
+                try:
+                    url_options[name] = parser(value[0])
+                except (TypeError, ValueError):
+                    warnings.warn(UserWarning(
+                        "Invalid value for `%s` in connection URL." % name
+                    ))
+            else:
                 url_options[name] = value[0]
 
-        # We only support redis:// and unix:// schemes.
-        if url.scheme == 'unix':
-            url_options.update({
-                'password': url.password,
-                'unix_socket_path': url.path,
-            })
+    password = url.password
+    path = url.path
+    hostname = url.hostname
 
-        else:
-            url_options.update({
-                'host': url.hostname,
-                'port': int(url.port or 6379),
-                'password': url.password,
-            })
+    # We only support redis://, rediss:// and unix:// schemes.
+    if url.scheme == 'unix':
+        url_options.update({
+            'host': None,
+            'port': None,
+            'password': password,
+            'unix_socket_path': path,
+            'connection_class': UnixDomainSocketConnection,
+        })
 
-            # If there's a path argument, use it as the db argument if a
-            # querystring value wasn't specified
-            if 'db' not in url_options and url.path:
-                try:
-                    url_options['db'] = int(url.path.replace('/', ''))
-                except (AttributeError, ValueError):
-                    pass
+    elif url.scheme in ('redis', 'rediss'):
+        url_options.update({
+            'host': hostname,
+            'port': int(url.port or 6379),
+            'password': password,
+        })
 
-            if url.scheme == 'rediss':
-                url_options['connection_class'] = SSLConnection
-
-        # last shot at the db value
-        url_options['db'] = int(url_options.get('db', db or 0))
-
-        # update the arguments from the URL values
-        kwargs.update(url_options)
-
-        # backwards compatability
-        if 'charset' in kwargs:
-            warnings.warn(DeprecationWarning(
-                '"charset" is deprecated. Use "encoding" instead'))
-            kwargs['encoding'] = kwargs.pop('charset')
-        if 'errors' in kwargs:
-            warnings.warn(DeprecationWarning(
-                '"errors" is deprecated. Use "encoding_errors" instead'))
-            kwargs['encoding_errors'] = kwargs.pop('errors')
-    else:
-        unix_socket_path = None
-        if ':' in server:
-            host, port = server.rsplit(':', 1)
+        # If there's a path argument, use it as the db argument if a
+        # querystring value wasn't specified
+        if 'db' not in url_options and path:
             try:
-                port = int(port)
-            except (ValueError, TypeError):
-                raise ImproperlyConfigured(
-                    "{0} from {1} must be an integer".format(
-                        repr(port),
-                        server
-                    )
-                )
-        else:
-            host, port = None, None
-            unix_socket_path = server
+                url_options['db'] = int(path.replace('/', ''))
+            except (AttributeError, ValueError):
+                pass
 
-        kwargs.update(
-            host=host,
-            port=port,
-            unix_socket_path=unix_socket_path,
-            db=db,
+        if url.scheme == 'rediss':
+            url_options['connection_class'] = SSLConnection
+        else:
+            url_options['connection_class'] = Connection
+    else:
+        valid_schemes = ', '.join(schemes)
+        raise ValueError(
+            "'%s' is not a valid Redis URL. A Redis URL must specify one of the following schemes "
+            "(%s)" % (
+                raw_url,
+                valid_schemes
+            )
         )
+
+    # last shot at the db value
+    url_options['db'] = int(url_options.get('db', db or 0))
+
+    # update the arguments from the URL values
+    kwargs.update(url_options)
+
+    # backwards compatability
+    if 'charset' in kwargs:
+        warnings.warn(DeprecationWarning(
+            '"charset" is deprecated. Use "encoding" instead'))
+        kwargs['encoding'] = kwargs.pop('charset')
+    if 'errors' in kwargs:
+        warnings.warn(DeprecationWarning(
+            '"errors" is deprecated. Use "encoding_errors" instead'))
+        kwargs['encoding_errors'] = kwargs.pop('errors')
 
     return kwargs

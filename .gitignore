@@ -20,3 +20,5 @@ MANIFEST
 redis/
 */_build/
 build/*
+.coverage
+htmlcov*

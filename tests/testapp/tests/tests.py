@@ -1,29 +1,17 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
-from hashlib import sha1
-import os
-import subprocess
+import pickle
 import threading
 import time
 
+from django.test import TestCase
+from fakeredis import FakeRedis
 
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
-
-from django.core.cache import caches
-from django.core.exceptions import ImproperlyConfigured
-from django.test import TestCase, override_settings
-from django.utils.encoding import force_bytes
-
-import redis
-
-from tests.testapp.models import Poll, expensive_calculation
-from redis_cache.cache import RedisCache, pool
-from redis_cache.constants import KEY_EXPIRED, KEY_NON_VOLATILE
-from redis_cache.utils import get_servers, parse_connection_kwargs
+from redis_cache.cache import RedisCache
+from tests.testapp.models import expensive_calculation
+from tests.testapp.models import Poll
+from redis_cache.constants import KEY_EXPIRED
 
 
 REDIS_PASSWORD = 'yadayada'
@@ -42,106 +30,14 @@ class C:
         return 24
 
 
-def start_redis_servers(servers, db=None, master=None):
-    """Creates redis instances using specified locations from the settings.
-
-    Returns list of Popen objects
-    """
-    processes = []
-    devnull = open(os.devnull, 'w')
-    master_connection_kwargs = master and parse_connection_kwargs(
-        master,
-        db=db,
-        password=REDIS_PASSWORD
-    )
-    for i, server in enumerate(servers):
-        connection_kwargs = parse_connection_kwargs(
-            server,
-            db=db,
-            password=REDIS_PASSWORD,  # will be overridden if specified in `server`
-        )
-        parameters = dict(
-            port=connection_kwargs.get('port', 0),
-            requirepass=connection_kwargs['password'],
-        )
-        is_socket = server.startswith('unix://') or server.startswith('/')
-        if is_socket:
-            parameters.update(
-                port=0,
-                unixsocket='/tmp/redis{0}.sock'.format(i),
-                unixsocketperm=755,
-            )
-        if master and not connection_kwargs == master_connection_kwargs:
-            parameters.update(
-                masterauth=master_connection_kwargs['password'],
-                slaveof="{host} {port}".format(
-                    host=master_connection_kwargs['host'],
-                    port=master_connection_kwargs['port'],
-                )
-            )
-
-        args = ['./redis/src/redis-server'] + [
-            "--{parameter} {value}".format(parameter=parameter, value=value)
-            for parameter, value in parameters.items()
-        ]
-        p = subprocess.Popen(args, stdout=devnull)
-        processes.append(p)
-
-    return processes
-
-
-class SetupMixin(object):
-    processes = None
-
-    @classmethod
-    def tearDownClass(cls):
-        for p in cls.processes:
-            p.kill()
-        cls.processes = None
-
-        # Give redis processes some time to shutdown
-        # time.sleep(.1)
+class RedisTestCase(TestCase):
 
     def setUp(self):
-        if self.__class__.processes is None:
-            from django.conf import settings
-
-            cache_settings = settings.CACHES['default']
-            servers = get_servers(cache_settings['LOCATION'])
-            options = cache_settings.get('OPTIONS', {})
-            db = options.get('db', 0)
-            master = options.get('MASTER_CACHE')
-            self.__class__.processes = start_redis_servers(
-                servers,
-                db=db,
-                master=master
-            )
-
-            # Give redis processes some time to startup
-            time.sleep(.1)
-
-        self.reset_pool()
-        self.cache = self.get_cache()
-
-    def tearDown(self):
-        # clear caches to allow @override_settings(CACHES=...) to work.
-        caches._caches.caches = {}
-        # Sometimes it will be necessary to skip this method because we need to
-        # test default initialization and that may be using a different port
-        # than the test redis server.
-        if hasattr(self, '_skip_tearDown') and self._skip_tearDown:
-            self._skip_tearDown = False
-            return
-        self.cache.clear()
-
-    def reset_pool(self):
-        pool.reset()
-
-    def get_cache(self, backend=None):
-        return caches[backend or 'default']
-
-
-class BaseRedisTestCase(SetupMixin):
+        self.cache = RedisCache('', {})
+        self.client = FakeRedis()
+        self.cache.writers = [self.client]
+        self.cache.readers = [self.client]
+        self.cache.router = type(self.cache.router)(self.cache)
 
     def test_simple(self):
         # Simple cache set/get works
@@ -282,11 +178,11 @@ class BaseRedisTestCase(SetupMixin):
 
     def test_expiration(self):
         # Cache values can be set to expire
-        self.cache.set('expire1', 'very quickly', 1)
-        self.cache.set('expire2', 'very quickly', 1)
-        self.cache.set('expire3', 'very quickly', 1)
+        self.cache.set('expire1', 'very quickly', .1)
+        self.cache.set('expire2', 'very quickly', .1)
+        self.cache.set('expire3', 'very quickly', .1)
 
-        time.sleep(2)
+        time.sleep(.2)
         self.assertEqual(self.cache.get("expire1"), None)
 
         self.cache.add("expire2", "newvalue")
@@ -344,8 +240,8 @@ class BaseRedisTestCase(SetupMixin):
 
     def test_set_many_expiration(self):
         # set_many takes a second ``timeout`` parameter
-        self.cache.set_many({"key1": "spam", "key2": "eggs"}, 1)
-        time.sleep(2)
+        self.cache.set_many({"key1": "spam", "key2": "eggs"}, .1)
+        time.sleep(.2)
         self.assertIsNone(self.cache.get("key1"))
         self.assertIsNone(self.cache.get("key2"))
 
@@ -468,24 +364,6 @@ class BaseRedisTestCase(SetupMixin):
         values = self.cache.get_many(['a', 'b'], version=2)
         self.assertEqual(len(values), 0)
 
-    def test_reinsert_keys(self):
-        self.cache._pickle_version = 0
-        for i in range(2000):
-            s = sha1(force_bytes(i)).hexdigest()
-            self.cache.set(s, self.cache)
-        self.cache._pickle_version = -1
-        self.cache.reinsert_keys()
-
-    def test_ttl_of_reinsert_keys(self):
-        self.cache.set('a', 'a', 5)
-        self.assertEqual(self.cache.get('a'), 'a')
-        self.cache.set('b', 'b', 5)
-        self.cache.reinsert_keys()
-        self.assertEqual(self.cache.get('a'), 'a')
-        self.assertGreater(self.cache.ttl('a'), 1)
-        self.assertEqual(self.cache.get('b'), 'b')
-        self.assertGreater(self.cache.ttl('a'), 1)
-
     def test_get_or_set(self):
 
         def expensive_function():
@@ -571,38 +449,6 @@ class BaseRedisTestCase(SetupMixin):
             4: 'a'
         })
 
-    def assertMaxConnection(self, cache, max_num):
-        for client in cache.clients.values():
-            self.assertLessEqual(client.connection_pool._created_connections, max_num)
-
-    def test_max_connections(self):
-        pool._connection_pools = {}
-        cache = caches['default']
-
-        def noop(*args, **kwargs):
-            pass
-
-        releases = {}
-        for client in cache.clients.values():
-            releases[client.connection_pool] = client.connection_pool.release
-            client.connection_pool.release = noop
-            self.assertEqual(client.connection_pool.max_connections, 2)
-
-        cache.set('a', 'a')
-        self.assertMaxConnection(cache, 1)
-
-        cache.set('a', 'a')
-        self.assertMaxConnection(cache, 2)
-
-        with self.assertRaises(redis.ConnectionError):
-            cache.set('a', 'a')
-
-        self.assertMaxConnection(cache, 2)
-
-        for client in cache.clients.values():
-            client.connection_pool.release = releases[client.connection_pool]
-            client.connection_pool.max_connections = 2 ** 31
-
     def test_has_key_with_no_key(self):
         self.assertFalse(self.cache.has_key('does_not_exist'))
 
@@ -659,51 +505,3 @@ class BaseRedisTestCase(SetupMixin):
         self.cache.touch('a', 20)
         ttl = self.cache.ttl('a')
         self.assertAlmostEqual(ttl, 20)
-
-
-class ConfigurationTestCase(SetupMixin, TestCase):
-
-    @override_settings(
-        CACHES={
-            'default': {
-                'BACKEND': 'redis_cache.RedisCache',
-                'LOCATION': LOCATION,
-                'OPTIONS': {
-                    'DB': 15,
-                    'PASSWORD': 'yadayada',
-                    'PARSER_CLASS': 'path.to.unknown.class',
-                    'PICKLE_VERSION': 2,
-                    'CONNECTION_POOL_CLASS': 'redis.ConnectionPool',
-                    'CONNECTION_POOL_CLASS_KWARGS': {
-                        'max_connections': 2,
-                    }
-                },
-            },
-        }
-    )
-    def test_bad_parser_import(self):
-        with self.assertRaises(ImproperlyConfigured):
-            caches['default']
-
-
-@override_settings(CACHES={
-    'default': {
-        'BACKEND': 'redis_cache.RedisCache',
-        'LOCATION': [
-            'redis://:yadayada@localhost:6381/15',
-            'redis://:yadayada@localhost:6382/15',
-            'redis://:yadayada@localhost:6383/15',
-        ],
-        'OPTIONS': {
-            'DB': 1,
-            'PASSWORD': 'yadayada',
-            'PARSER_CLASS': 'redis.connection.HiredisParser',
-            'PICKLE_VERSION': -1,
-            'MASTER_CACHE': 'redis://:yadayada@localhost:6381/15',
-        },
-    },
-})
-class RedisUrlRegressionTests(SetupMixin, TestCase):
-
-    def test_unix_path_error_using_redis_url(self):
-        pass

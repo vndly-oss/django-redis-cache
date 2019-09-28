@@ -71,6 +71,7 @@ class YAMLSerializer(BaseSerializer):
     def deserialize(self, value):
         return yaml.load(value)
 
+
 class DummySerializer(BaseSerializer):
 
     def __init__(self, **kwargs):
