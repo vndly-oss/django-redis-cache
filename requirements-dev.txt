@@ -5,3 +5,4 @@ msgpack-python==0.4.6
 pyyaml==5.1
 mock
 fakeredis
+lupa
