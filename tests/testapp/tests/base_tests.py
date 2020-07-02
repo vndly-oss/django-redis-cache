@@ -511,6 +511,10 @@ class BaseRedisTestCase(SetupMixin):
         self.assertEqual(expensive_function.num_calls, 2)
         self.assertEqual(value, 42)
 
+    def test_get_or_set_with_none_value(self):
+        value = self.cache.get_or_set('key', lambda: None, 1, None, 1)
+        assert value is None
+
     def test_get_or_set_serving_from_stale_value(self):
 
         def expensive_function(x):
@@ -537,6 +541,8 @@ class BaseRedisTestCase(SetupMixin):
         thread_2 = threading.Thread(target=thread_worker, args=(2, 'c', 1, None, 1))
         thread_3 = threading.Thread(target=thread_worker, args=(3, 'd', 1, None, 1))
         thread_4 = threading.Thread(target=thread_worker, args=(4, 'e', 1, None, 1))
+        thread_5 = threading.Thread(target=thread_worker, args=(5, None, 1, None, 1))
+        thread_6 = threading.Thread(target=thread_worker, args=(6, 'g', 1, None, 1))
 
         # First thread should complete and return its value
         thread_0.start()  # t = 0, valid from t = .5 - 1.5, stale from t = 1.5 - 2.5
@@ -556,19 +562,31 @@ class BaseRedisTestCase(SetupMixin):
         # before the first thread's stale cache has expired.
         time.sleep(.25)  # t = 2
         thread_4.start()
+        # Sixth thread will start after fourth thread's value is no longer current, explicitly sets
+        # none as the result
+        # valid from t = 4 - 5, stale from t = 5 - 6
+        time.sleep(1.5)  # t = 3.5
+        thread_5.start()
+        # Seventh thread will start after sixth value has cached - should get None
+        time.sleep(1)   # t = 4.5
+        thread_6.start()
 
         thread_0.join()
         thread_1.join()
         thread_2.join()
         thread_3.join()
         thread_4.join()
+        thread_5.join()
+        thread_6.join()
 
         self.assertEqual(results, {
             0: 'a',
-            1: None,
+            1: 'a',
             2: 'a',
             3: 'd',
-            4: 'a'
+            4: 'a',
+            5: None,
+            6: None,
         })
 
     def assertMaxConnection(self, cache, max_num):
