@@ -2,7 +2,6 @@ import importlib
 import warnings
 
 from django.core.exceptions import ImproperlyConfigured
-from django.utils.encoding import force_text
 from six import python_2_unicode_compatible, string_types
 from six.moves.urllib.parse import parse_qs, urlparse
 
